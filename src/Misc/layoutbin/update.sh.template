@@ -135,12 +135,17 @@ if [[ "$currentplatform" == 'darwin'  && restartinteractiverunner -eq 0 ]]; then
     then
         # inspect the open file handles to find the node process
         # we can't actually inspect the process using ps because it uses relative paths and doesn't follow symlinks
-        nodever="node16"
+        nodever="node20"
         path=$(lsof -a -g "$procgroup" -F n | grep $nodever/bin/node | grep externals | tail -1 | cut -c2-)
-        if [[ $? -ne 0 || -z "$path" ]] # Fallback if RunnerService.js was started with node12
+        if [[ $? -ne 0 || -z "$path" ]] # Fallback if RunnerService.js was started with node16
         then
-            nodever="node12"
+            nodever="node16"
             path=$(lsof -a -g "$procgroup" -F n | grep $nodever/bin/node | grep externals | tail -1 | cut -c2-)
+            if [[ $? -ne 0 || -z "$path" ]] # Fallback if RunnerService.js was started with node12
+            then
+                nodever="node12"
+                path=$(lsof -a -g "$procgroup" -F n | grep $nodever/bin/node | grep externals | tail -1 | cut -c2-)
+            fi
         fi
         if [[ $? -eq 0 && -n "$path" ]]
         then
@@ -178,7 +183,23 @@ if [[ "$currentplatform" == 'darwin'  && restartinteractiverunner -eq 0 ]]; then
     fi
 fi
 
+# update runsvc.sh
+if [ -f "$rootfolder/runsvc.sh" ]
+then
+    date "+[%F %T-%4N] Update runsvc.sh" >> "$logfile" 2>&1
+    cat "$rootfolder/bin/runsvc.sh" > "$rootfolder/runsvc.sh"
+    if [ $? -ne 0 ]
+    then
+        date "+[%F %T-%4N] Can't update $rootfolder/runsvc.sh using $rootfolder/bin/runsvc.sh" >> "$logfile" 2>&1
+        mv -fv "$logfile" "$logfile.failed"
+        exit 1
+    fi
+fi
+
 date "+[%F %T-%4N] Update succeed" >> "$logfile"
+
+touch update.finished
+date "+[%F %T-%4N] update.finished file creation succeed" >> "$logfile"
 
 # rename the update log file with %logfile%.succeed/.failed/succeedneedrestart
 # runner service host can base on the log file name determin the result of the runner update
