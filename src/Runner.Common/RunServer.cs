@@ -1,14 +1,15 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Runtime.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using GitHub.Actions.RunService.WebApi;
 using GitHub.DistributedTask.Pipelines;
 using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Common.Util;
 using GitHub.Runner.Sdk;
 using GitHub.Services.Common;
-using GitHub.Services.WebApi;
+using Sdk.RSWebApi.Contracts;
+using Sdk.WebApi.WebApi.RawClient;
 
 namespace GitHub.Runner.Common
 {
@@ -17,46 +18,49 @@ namespace GitHub.Runner.Common
     {
         Task ConnectAsync(Uri serverUrl, VssCredentials credentials);
 
-        Task<AgentJobRequestMessage> GetJobMessageAsync(string id, CancellationToken token);
+        Task<AgentJobRequestMessage> GetJobMessageAsync(string id, string billingOwnerId, CancellationToken token);
+
+        Task CompleteJobAsync(
+            Guid planId,
+            Guid jobId,
+            TaskResult result,
+            Dictionary<String, VariableValue> outputs,
+            IList<StepResult> stepResults,
+            IList<Annotation> jobAnnotations,
+            string environmentUrl,
+            IList<Telemetry> telemetry,
+            string billingOwnerId,
+            CancellationToken token);
+
+        Task CompleteJob2Async(
+            Guid planId,
+            Guid jobId,
+            TaskResult result,
+            Dictionary<String, VariableValue> outputs,
+            IList<StepResult> stepResults,
+            IList<Annotation> jobAnnotations,
+            string environmentUrl,
+            IList<Telemetry> telemetry,
+            string billingOwnerId,
+            CancellationToken token);
+
+        Task<RenewJobResponse> RenewJobAsync(Guid planId, Guid jobId, CancellationToken token);
     }
 
     public sealed class RunServer : RunnerService, IRunServer
     {
         private bool _hasConnection;
-        private VssConnection _connection;
-        private TaskAgentHttpClient _taskAgentClient;
+        private Uri requestUri;
+        private RawConnection _connection;
+        private RunServiceHttpClient _runServiceHttpClient;
 
-        public async Task ConnectAsync(Uri serverUrl, VssCredentials credentials)
+        public async Task ConnectAsync(Uri serverUri, VssCredentials credentials)
         {
-            _connection = await EstablishVssConnection(serverUrl, credentials, TimeSpan.FromSeconds(100));
-            _taskAgentClient = _connection.GetClient<TaskAgentHttpClient>();
+            requestUri = serverUri;
+
+            _connection = VssUtil.CreateRawConnection(serverUri, credentials);
+            _runServiceHttpClient = await _connection.GetClientAsync<RunServiceHttpClient>();
             _hasConnection = true;
-        }
-
-        private async Task<VssConnection> EstablishVssConnection(Uri serverUrl, VssCredentials credentials, TimeSpan timeout)
-        {
-            Trace.Info($"EstablishVssConnection");
-            Trace.Info($"Establish connection with {timeout.TotalSeconds} seconds timeout.");
-            int attemptCount = 5;
-            while (attemptCount-- > 0)
-            {
-                var connection = VssUtil.CreateConnection(serverUrl, credentials, timeout: timeout);
-                try
-                {
-                    await connection.ConnectAsync();
-                    return connection;
-                }
-                catch (Exception ex) when (attemptCount > 0)
-                {
-                    Trace.Info($"Catch exception during connect. {attemptCount} attempt left.");
-                    Trace.Error(ex);
-
-                    await HostContext.Delay(TimeSpan.FromMilliseconds(100), CancellationToken.None);
-                }
-            }
-
-            // should never reach here.
-            throw new InvalidOperationException(nameof(EstablishVssConnection));
         }
 
         private void CheckConnection()
@@ -67,40 +71,60 @@ namespace GitHub.Runner.Common
             }
         }
 
-        public Task<AgentJobRequestMessage> GetJobMessageAsync(string id, CancellationToken cancellationToken)
+        public Task<AgentJobRequestMessage> GetJobMessageAsync(string id, string billingOwnerId, CancellationToken cancellationToken)
         {
             CheckConnection();
-            var jobMessage = RetryRequest<AgentJobRequestMessage>(async () =>
-                                                    {
-                                                        return await _taskAgentClient.GetJobMessageAsync(id, cancellationToken);
-                                                    }, cancellationToken);
-            return jobMessage;
+            return RetryRequest<AgentJobRequestMessage>(
+                async () => await _runServiceHttpClient.GetJobMessageAsync(requestUri, id, VarUtil.OS, billingOwnerId, cancellationToken), cancellationToken,
+                shouldRetry: ex =>
+                    ex is not TaskOrchestrationJobNotFoundException &&          // HTTP status 404
+                    ex is not TaskOrchestrationJobAlreadyAcquiredException &&   // HTTP status 409
+                    ex is not TaskOrchestrationJobUnprocessableException);      // HTTP status 422
         }
 
-        private async Task<T> RetryRequest<T>(Func<Task<T>> func,
-                                              CancellationToken cancellationToken,
-                                              int maxRetryAttemptsCount = 5
-                                             )
+        // Legacy will be deleted when SkipRetryCompleteJobUponKnownErrors is cleaned up
+        public Task CompleteJobAsync(
+            Guid planId,
+            Guid jobId,
+            TaskResult result,
+            Dictionary<String, VariableValue> outputs,
+            IList<StepResult> stepResults,
+            IList<Annotation> jobAnnotations,
+            string environmentUrl,
+            IList<Telemetry> telemetry,
+            string billingOwnerId,
+            CancellationToken cancellationToken)
         {
-            var retryCount = 0;
-            while (true)
-            {
-                retryCount++;
-                cancellationToken.ThrowIfCancellationRequested();
-                try
-                {
-                    return await func();
-                }
-                // TODO: Add handling of non-retriable exceptions: https://github.com/github/actions-broker/issues/122
-                catch (Exception ex) when (retryCount < maxRetryAttemptsCount)
-                {
-                    Trace.Error("Catch exception during get full job message");
-                    Trace.Error(ex);
-                    var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15));
-                    Trace.Warning($"Back off {backOff.TotalSeconds} seconds before next retry. {maxRetryAttemptsCount - retryCount} attempt left.");
-                    await Task.Delay(backOff, cancellationToken);
-                }
-            }
+            CheckConnection();
+            return RetryRequest(
+                async () => await _runServiceHttpClient.CompleteJobAsync(requestUri, planId, jobId, result, outputs, stepResults, jobAnnotations, environmentUrl, telemetry, billingOwnerId, cancellationToken), cancellationToken);
+        }
+
+        public Task CompleteJob2Async(
+            Guid planId,
+            Guid jobId,
+            TaskResult result,
+            Dictionary<String, VariableValue> outputs,
+            IList<StepResult> stepResults,
+            IList<Annotation> jobAnnotations,
+            string environmentUrl,
+            IList<Telemetry> telemetry,
+            string billingOwnerId,
+            CancellationToken cancellationToken)
+        {
+            CheckConnection();
+            return RetryRequest(
+                async () => await _runServiceHttpClient.CompleteJobAsync(requestUri, planId, jobId, result, outputs, stepResults, jobAnnotations, environmentUrl, telemetry, billingOwnerId, cancellationToken), cancellationToken,
+                shouldRetry: ex =>
+                    ex is not VssUnauthorizedException &&               // HTTP status 401
+                    ex is not TaskOrchestrationJobNotFoundException);   // HTTP status 404
+        }
+
+        public Task<RenewJobResponse> RenewJobAsync(Guid planId, Guid jobId, CancellationToken cancellationToken)
+        {
+            CheckConnection();
+            return RetryRequest<RenewJobResponse>(
+                async () => await _runServiceHttpClient.RenewJobAsync(requestUri, planId, jobId, cancellationToken), cancellationToken);
         }
     }
 }
